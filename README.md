@@ -13,7 +13,7 @@ Chatwoot（客服系统，chat.blueaisoft.com，云端/205）
       │ AgentBot 机制：按收件箱绑定的 bot，把消息 POST 到
       │ http://192.168.0.206:8300/webhook/chatwoot（HMAC 签名防伪造）
       ▼
-bridge.mjs（本仓库，8300 端口）
+bridge-v11.mjs（本仓库，8300 端口）
       │ ① 验签（防伪造请求）
       │ ② 按收件箱查路由表：该品牌 → 哪个 AI Agent + 用哪个身份回复
       │ ③ 去重 / 会话排队（同一客户的消息严格按顺序）

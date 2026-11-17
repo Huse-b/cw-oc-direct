@@ -2,14 +2,20 @@
 /**
  * Chatwoot ↔ OpenClaw 直连桥 v1.1（单实例多收件箱动态路由）
  *
- * 数据流：
- *   Chatwoot webhook（全部品牌 bot 的 outgoing_url 统一指向本服务）
- *     → HMAC 验签（双格式自适应）→ 过滤 → 持久化去重
- *     → 路由表解析（inbox → Agent + bot token）
- *     → 会话锁串行 → OpenClaw WS RPC → 回复 → Chatwoot API（bot 身份）
+ * 【本文件是唯一生产入口】launchd 服务 com.blueaisoft.cw-oc-bridge 运行本文件；
+ * 旧版 bridge.mjs（单品牌时代）已从仓库删除。
+ * 所有品牌 bot 的 outgoing_url 都指向本服务同一端口，由 routes.json 决定
+ * 「哪个收件箱 → 用哪个 Agent 生成 + 以哪个 bot 身份回复」，加品牌只需改配置。
  *
- * 运行：/Users/mac6/.local/opt/node24/bin/node bridge.mjs
- * 依赖：仅 Node 24 内置（WebSocket / fetch / crypto / fs）
+ * 数据流（一条客户消息的完整旅程）：
+ *   Chatwoot AgentBot 回调（HMAC 签名）
+ *     → 验签（双格式自适应）→ 事件过滤 → 持久化去重
+ *     → 路由表解析（inbox → Agent + bot token）
+ *     → 并发准入 → OpenClaw WS RPC 生成回复（30s 超时）
+ *     → 以品牌 bot 身份发回 Chatwoot；超时/失败 → 兜底文案 + 私有备注
+ *
+ * 运行：/Users/mac6/.local/opt/node24/bin/node bridge-v11.mjs
+ * 依赖：仅 Node 24 内置（WebSocket / fetch / crypto / fs），零第三方依赖
  */
 import http from "node:http";
 import crypto from "node:crypto";
@@ -109,7 +115,10 @@ function secretsList() {
   return ROUTES.secrets.length ? ROUTES.secrets : [];
 }
 
-// ---------- 持久化去重（SQLite 更轻替代：JSONL 追加 + 启动加载近 24h） ----------
+// ---------- 持久化去重（防 Chatwoot 重投/重启后重复处理 → 双回复） ----------
+// 机制：messageId → 时间戳（内存 Map），窗口 24h；
+// 每 20 条增量落盘 JSONL + 每 5min 压缩重写，启动时回读最近 5000 行恢复水位。
+// 不去重的后果：客户同一条消息收到两次 AI 回复。
 const DEDUP_FILE = process.env.DEDUP_FILE || path.join(path.dirname(new URL(import.meta.url).pathname), "dedup.jsonl");
 const seenMessages = new Map(); // messageId -> ts
 const DEDUP_WINDOW = 24 * 60 * 60 * 1000;
@@ -148,7 +157,16 @@ setInterval(() => {
 }, 300_000).unref();
 
 // ---------- 会话锁（串行）与并发控制 ----------
+// 【v1.1 实际行为，接手者必读】
+//   主链路是 handleMessage()（由 HTTP 入口调用），它只经过 scheduleTask() 的
+//   「准入检查」——满载时跳过限流直接执行并打 WARN 告警。
+//   本节的 enqueueByConversation（同会话串行）和 waitQueue 调度器（队列排队）
+//   仅被下方遗留的 processMessage() 使用，主链路未接入：
+//   waitQueue 实际恒为空（scheduleTask 不入队），调度循环空转。
+//   同会话严格串行 / 队列排队属后续版本工作项（设计见 docs/ 架构设计 §2.3）。
 const convLocks = new Map();
+// 把同一会话的任务串成 Promise 链：后到的消息等前一条处理完再执行。
+// 【遗留】当前主链路未使用，仅 processMessage() 调用。
 function enqueueByConversation(convId, task) {
   const prev = convLocks.get(convId) || Promise.resolve();
   const next = prev.then(task, task);
@@ -160,6 +178,9 @@ function enqueueByConversation(convId, task) {
 }
 
 // 有界并发（全局 + 每品牌）与队列
+// 【遗留】本调度器只消费 waitQueue，而 scheduleTask 从不入队（见下），
+// 故此循环实际空转；并发计数 globalRunning 也因此恒为 0。
+// 保留原因：v1.1 规划的完整排队机制在此，接入主链路时可复用。
 const MAX_GLOBAL = Number(process.env.MAX_GLOBAL_CONCURRENCY || 4);
 const MAX_PER_INBOX = Number(process.env.MAX_PER_INBOX_CONCURRENCY || 2);
 const MAX_QUEUE = Number(process.env.MAX_QUEUE_SIZE || 100);
@@ -175,6 +196,9 @@ setInterval(() => {
   }
 }, 500).unref();
 
+// 并发准入检查：达到任一上限时返回 queued:false。
+// 【注意】无论 queued 与否，调用方都会立即执行 task（见 handleMessage 尾部）——
+// 即 v1.1 实际语义是「满载告警 + 直通」，并未真正限流排队。
 function scheduleTask(inboxId, task) {
   const brandRunning = inboxRunning.get(inboxId) || 0;
   if (globalRunning >= MAX_GLOBAL || brandRunning >= MAX_PER_INBOX || waitQueue.length >= MAX_QUEUE) {
@@ -204,6 +228,13 @@ const LOG = (level, msg, extra) =>
   console.log(`${new Date().toISOString()} [${level}] ${msg}${extra ? " " + JSON.stringify(extra) : ""}`);
 
 // ---------- Chatwoot 验签（双格式自适应） ----------
+// Chatwoot 有两种回调，签名格式不同（源码 lib/webhooks/trigger.rb）：
+//   ① AgentBot 回调（当前主链路）：HMAC(secret, "时间戳.消息体")，头 X-Chatwoot-Timestamp
+//   ② 账户级 webhook：HMAC(secret, 消息体)，无时间戳头
+// 两种候选依次试算，secrets 池存多个 bot 的候选 secret；
+// timingSafeEqual 恒定时间比对防时序侧信道。
+// 曾因只实现纯 body 格式 + secret 配错，AgentBot 投递全 401，
+// Chatwoot 自动把会话转 open 导致浮窗瘫痪 2 小时（见 docs/排错手册）。
 function verifySignature(rawBody, signatureHeader, timestampHeader, secrets) {
   if (!secrets.length) return true;
   if (!signatureHeader) return false;
@@ -221,6 +252,12 @@ function verifySignature(rawBody, signatureHeader, timestampHeader, secrets) {
 }
 
 // ---------- OpenClaw WS RPC ----------
+// 与 OpenClaw Gateway 保持一条 WebSocket 长连接复用：
+//   - 请求帧 {type:"req", id, method, params}，响应帧 {type:"res", id, ok, payload}，
+//     用自增 id 关联（注意 type 是 "req" 而非 "request"，且没有 jsonrpc 字段——
+//     写错会被 Gateway 以 1008 断连，这是实测踩过的坑）
+//   - 帧分发三分支：res（请求-响应）/ event（流式事件）/ 广播监听器（collector）
+//   - 所有等待点都有强制超时（Gateway 假死时 recv 永不返回，无超时会挂死整条链路）
 class GatewayRPC {
   constructor() {
     this.ws = null;
@@ -239,6 +276,8 @@ class GatewayRPC {
       ws.onopen = () => {
         clearTimeout(timer);
         this.ws = ws;
+        // connect 握手参数是 Gateway 硬契约：minProtocol/maxProtocol=4，
+        // client 必须含 id/version/platform/mode 四字段，role/scopes/auth 缺一不可。
         this.send({
           type: "req", id: `hs-${++this.reqId}`, method: "connect",
           params: {
@@ -300,7 +339,14 @@ class GatewayRPC {
       this.eventWaiters.push({ predicate, resolve, timer });
     });
   }
-  /** 发消息并收集回复（v1.1：delta 追加/快照覆盖/replace 替换三语义 + runId 隔离 + 迟到丢弃） */
+  /** 发消息并收集回复（一次完整的 Agent 调用）：
+   *  ① sessions.create 建/复用会话（key 相同则复用，上下文得以延续）
+   *  ② sessions.send 发客户消息，拿到 runId
+   *  ③ collector 持续收集 assistant 流式帧：
+   *     - runId 过滤：只认本次发送的 run（多会话共享连接，防跨会话串扰）
+   *     - 三语义：delta 追加 / text 全量快照覆盖 / replace 整段替换
+   *  ④ 等 lifecycle done 帧或超时；超时已兜底的消息，迟到的 AI 帧一律丢弃
+   *     （否则客户先收兜底文案再收迟到回复 = 双回复事故） */
   async chat(agentKey, message, timeoutMs) {
     await this.ensureConnected();
     const created = await this.request("sessions.create", { key: agentKey }, 15000);
@@ -349,7 +395,9 @@ class GatewayRPC {
 }
 const gw = new GatewayRPC();
 
-// ---------- Chatwoot API ----------
+// ---------- Chatwoot API（回复出口） ----------
+// sendChatwootReply：以「品牌 bot 的 access_token」身份发消息，客户在浮窗看到的是
+//                    该品牌机器人而非真人客服；botToken 来自路由表 inboxMap。
 async function sendChatwootReply(conversationId, content, botToken) {
   const url = `${CFG.chatwootBase}/api/v1/accounts/${CFG.accountId}/conversations/${conversationId}/messages`;
   const res = await fetch(url, {
@@ -370,6 +418,9 @@ async function addPrivateNote(conversationId, content) {
     });
   } catch {}
 }
+// 转人工：pending → open（open 会话 AgentBot 不再处理，交人工接管）。
+// 【未接入】当前无调用方：超时/失败降级时只发兜底文案 + 私有备注，
+// 会话仍留在 pending 由 bot 继续服务；如需「降级即转人工」在降级分支补调用本函数。
 async function setConversationOpen(conversationId) {
   try {
     const url = `${CFG.chatwootBase}/api/v1/accounts/${CFG.accountId}/conversations/${conversationId}`;
@@ -383,9 +434,13 @@ async function setConversationOpen(conversationId) {
   } catch {}
 }
 
-// ---------- 处理一条 incoming ----------
+// ---------- 消息处理 ----------
+// FALLBACK_TEXT：兜底文案。Agent 超时/异常/空回复时发给客户，保证客户永远有响应。
 const FALLBACK_TEXT = "抱歉，我这边暂时无法回答，已记录您的问题，人工稍后会跟进。";
 
+// 【遗留死代码】processMessage 未被任何入口调用（HTTP 入口走 handleMessage），
+// 与 handleMessage 逻辑高度重复，仅会话串行部分（enqueueByConversation）与之不同。
+// 保留仅作 v1.1 会话串行实现的参考，可安全删除。
 async function processMessage(payload, route) {
   const msgId = payload.id;
   const convId = payload.conversation?.id;
@@ -437,7 +492,7 @@ async function handleMessage(payload) {
   const content = String(payload.content || "").trim();
   if (!msgId || !convId || !content) return { ignored: true, reason: "missing fields" };
 
-  // 路由：未映射 inbox → 降级三件套（兜底文案 + 转人工 + 私有备注）
+  // 路由：未映射 inbox → 降级处理（兜底文案 + 私有备注，保证客户不失联）
   const route = routeFor(inboxId);
   if (!route) {
     LOG("WARN", "未映射 inbox，降级处理", { inboxId, msgId });
@@ -450,6 +505,9 @@ async function handleMessage(payload) {
   if (seenMessages.has(msgId)) return { duplicate: true };
   markSeen(msgId);
 
+  // 会话级 session key：格式 agent:{agent}:cw:{account}:{inbox}:{conv}。
+  // 一个会话一个 OpenClaw session（key 相同复用），上下文自然延续；
+  // inbox 编号入 key，同 Agent 服务多品牌时上下文互不串。
   const agentKey = `agent:${route.agent}:cw:1:${inboxId}:${convId}`;
   LOG("INFO", "处理消息", { msgId, convId, inbox: inboxId, agent: route.agent });
 
@@ -525,6 +583,8 @@ const server = http.createServer(async (req, res) => {
     let raw = "";
     req.on("data", (c) => (raw += c));
     req.on("end", async () => {
+      // 验签失败必须回 401：Chatwoot 收到非 2xx 会把会话自动转 open（人工接管），
+      // 客户不至于干等机器人；但若 secret 配错，所有会话都会被转走 = 浮窗瘫痪。
       if (!verifySignature(raw, req.headers["x-chatwoot-signature"], req.headers["x-chatwoot-timestamp"], secretsList())) {
         res.writeHead(401).end(JSON.stringify({ error: "invalid signature" }));
         LOG("WARN", "验签失败", { ip: req.socket.remoteAddress });
@@ -536,9 +596,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (payload.event !== "message_created" || payload.message_type !== "incoming" || payload.private) {
+        // 只处理「客户发的非私有消息」：bot 自己的回复、agent 手工消息、
+        // 私有备注都不应触发 AI（否则会自我循环回复）。
         res.writeHead(200).end(JSON.stringify({ ignored: true }));
         return;
       }
+      // 先回 200 再异步处理：Chatwoot 侧有投递超时（约 5s），
+      // 而 AI 生成要 4-20s，若同步等待会因超时被判失败 → 会话被转 open。
       res.writeHead(200).end(JSON.stringify({ accepted: true }));
       try {
         const r = await handleMessage(payload);

@@ -6,3 +6,4 @@ dedup.jsonl
 stats.jsonl
 frpc/frpc
 frpc/*.log
+.DS_Store

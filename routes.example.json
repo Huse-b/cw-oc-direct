@@ -1,0 +1,16 @@
+{
+  "_说明": "本文件是 routes.json 的样例模板。routes.json 含真实密钥已被 .gitignore 排除；复制本文件为 routes.json 后按实际环境填写，60 秒内自动热重载生效。",
+  "secrets": [
+    "（Chatwoot 各 bot 的 secret，可放多个候选；来源：后台 Settings→Bots 或 API GET /agent_bots/{id} 的 secret 字段）"
+  ],
+  "inboxMap": {
+    "7": {
+      "agent": "bluewms-support",
+      "botToken": "（BlueWMS bot 的 access_token，回复时以此身份显示）"
+    },
+    "8": {
+      "agent": "zhuofeng-support",
+      "botToken": "（卓风 bot 的 access_token）"
+    }
+  }
+}
