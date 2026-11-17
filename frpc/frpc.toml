@@ -1,0 +1,11 @@
+serverAddr = "124.223.140.242"
+serverPort = 7000
+auth.token = "sh-frps-2024-token-7d2x"
+transport.tls.enable = true
+
+[[proxies]]
+name = "bluewms-bridge"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8300
+customDomains = ["bluewms-bridge.blueaisoft.com"]
