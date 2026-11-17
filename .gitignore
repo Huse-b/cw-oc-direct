@@ -1,0 +1,8 @@
+# 运行数据与密钥不入库
+routes.json
+data/
+logs/
+dedup.jsonl
+stats.jsonl
+frpc/frpc
+frpc/*.log
