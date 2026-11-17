@@ -7,3 +7,4 @@ stats.jsonl
 frpc/frpc
 frpc/*.log
 .DS_Store
+frpc/*.toml

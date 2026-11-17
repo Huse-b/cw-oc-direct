@@ -1,6 +1,8 @@
 serverAddr = "124.223.140.242"
 serverPort = 7000
-auth.token = "sh-frps-2024-token-7d2x"
+# 鉴权 token 已脱敏：真实值存于生产机本地配置，不入 Git。
+# 如需启用 frpc：向运维索取 frps 的 auth.token 后填入下方。
+auth.token = "REDACTED-请填入真实token"
 transport.tls.enable = true
 
 [[proxies]]
